@@ -1,0 +1,134 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Roboto+Mono:wght@400;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  background: #f8fafc; /* Troquei para uma cor mais neutra por padrão, o dashboard TV já sobrescreve se precisar */
+  color: #c9d1d9;
+  font-family: 'Inter', system-ui, sans-serif;
+  height: 100%;
+  width: 100%;
+}
+
+/* scrollbar oculta */
+::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* Animação de ticker */
+@keyframes ticker {
+  0% {
+    transform: translateX(0);
+  }
+
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.ticker-track {
+  display: flex;
+  animation: ticker 40s linear infinite;
+  white-space: nowrap;
+}
+
+/* glow verde */
+.glow-green {
+  text-shadow: 0 0 8px rgba(46, 204, 113, 0.7);
+}
+
+.glow-yellow {
+  text-shadow: 0 0 8px rgba(241, 196, 15, 0.7);
+}
+
+.glow-red {
+  text-shadow: 0 0 8px rgba(231, 76, 60, 0.7);
+}
+
+/* barra de progresso animada */
+@keyframes barGrow {
+  from {
+    width: 0;
+  }
+}
+
+.bar-grow {
+  animation: barGrow 1.2s ease-out forwards;
+}
+
+/* Pulse dot */
+@keyframes pulseDot {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.pulse-dot {
+  animation: pulseDot 1.5s ease-in-out infinite;
+}
+
+/* Number count-up blur */
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-up {
+  animation: fadeUp 0.5s ease-out forwards;
+}
+
+/* Fade In para carrossel */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.4s ease-out forwards;
+}
+
+/* Pulse suave para meta batida */
+@keyframes pulseGentle {
+  0%, 100% {
+    opacity: 1;
+    filter: brightness(1);
+  }
+  50% {
+    opacity: 0.85;
+    filter: brightness(1.2);
+  }
+}
+
+.animate-pulse-gentle {
+  animation: pulseGentle 2s ease-in-out infinite;
+}

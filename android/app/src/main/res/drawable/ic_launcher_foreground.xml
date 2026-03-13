@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 
+        Logo centralizada e pequena. 
+        Padding de 40dp garante que ela fique centralizada e sem bordas extras.
+    -->
+    <item
+    android:drawable="@drawable/app_icon_foreground"
+    android:gravity="center"
+    android:top="80dp"
+    android:bottom="80dp"
+    android:left="44dp"
+    android:right="44dp" />
+</layer-list>

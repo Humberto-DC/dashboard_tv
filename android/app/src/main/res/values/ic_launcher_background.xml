@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Background azul escuro para combinar com a identidade visual -->
+    <color name="ic_launcher_background">#061d33</color>
+</resources>

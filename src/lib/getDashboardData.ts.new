@@ -1,0 +1,496 @@
+import pool from "./db";
+import { toNum } from "./utils";
+import type { TVDashboardData } from "@/types/dashboard";
+
+const EMPRESA_IDS = ["1", "2", "3", "5", "6"];
+const SELLER_IDS = ["244", "12", "17", "200", "110", "193", "114", "215", "108", "163"];
+
+// ---- Query filiais (meta mensal, realizado, hoje) ----
+const SQL_FILIAIS = `
+WITH
+  params_cte AS (SELECT CURRENT_DATE::date AS ref),
+  periodo_cte AS (
+    SELECT
+      date_trunc('month', pm.ref)::date AS dt_ini,
+      (date_trunc('month', pm.ref) + interval '1 month - 1 day')::date AS dt_fim
+    FROM params_cte pm
+  ),
+  metas_filial_cte AS (
+    SELECT m.empresa_id::text AS empresa_id, COALESCE(SUM(m.meta),0)::numeric AS meta
+    FROM public.metas m
+    WHERE m.empresa_id::text = ANY($1::text[])
+      AND m.ano_mes::text = (EXTRACT(YEAR FROM CURRENT_DATE)::text || LPAD(EXTRACT(MONTH FROM CURRENT_DATE)::text, 2, '0'))
+    GROUP BY 1
+  ),
+  vendas_itens_f_cte AS (
+    SELECT 
+        io.orcamento_id,
+        SUM(COALESCE(io.quantidade * io.icms_medio, 0)) as icms_rs,
+        SUM(COALESCE(io.quantidade * io.credito_pis_cofins_medio, 0)) as pis_cofins_rs
+    FROM public.itens_orcamentos io
+    JOIN public.orcamentos o ON o.orcamento_id = io.orcamento_id
+    CROSS JOIN periodo_cte p
+    WHERE o.data_recebimento::date >= p.dt_ini AND o.data_recebimento::date <= p.dt_fim
+      AND COALESCE(o.cancelado,'N') = 'N'
+    GROUP BY 1
+  ),
+  vendas_mes_f_cte AS (
+    SELECT
+      o.empresa_id::text AS empresa_id,
+      SUM(COALESCE(o.valor_pedido,0))::numeric AS valor_bruto,
+      SUM(COALESCE(o.valor_pedido, 0) - COALESCE(o.valor_ipi, 0) - COALESCE(o.valor_subst_trib, 0) - COALESCE(o.valor_fcp_st, 0) - COALESCE(o.valor_outras_desp_manual, 0) - COALESCE(vi.icms_rs, 0) - COALESCE(vi.pis_cofins_rs, 0))::numeric AS base_vendas_bruta,
+      SUM((COALESCE(o.valor_pedido, 0) - COALESCE(o.valor_ipi, 0) - COALESCE(o.valor_subst_trib, 0) - COALESCE(o.valor_fcp_st, 0) - COALESCE(o.valor_outras_desp_manual, 0) - COALESCE(vi.icms_rs, 0) - COALESCE(vi.pis_cofins_rs, 0)) * COALESCE(o.perc_lucro_fechamento, 0) / 100.0)::numeric AS lucro_vendas_abs,
+      SUM(COALESCE(o.valor_outras_desp_manual,0))::numeric AS desp_op,
+      COUNT(DISTINCT o.orcamento_id) FILTER (WHERE COALESCE(o.pedido_fechado,'N')='S')::int AS closed_budgets
+    FROM public.orcamentos o
+    CROSS JOIN periodo_cte p
+    LEFT JOIN vendas_itens_f_cte vi ON vi.orcamento_id = o.orcamento_id
+    WHERE o.data_recebimento::date >= p.dt_ini AND o.data_recebimento::date <= p.dt_fim
+      AND COALESCE(o.cancelado,'N') = 'N'
+      AND COALESCE(o.recebido,'S') = 'S'
+      AND o.empresa_id::text = ANY($1::text[])
+    GROUP BY 1
+  ),
+  dev_mes_f_cte AS (
+    SELECT 
+      rd.empresa_id::text AS empresa_id, 
+      SUM(COALESCE(ird.quantidade*ird.preco_venda,0))::numeric AS total_dev,
+      SUM(COALESCE(ird.quantidade*ird.preco_venda,0) * COALESCE(o_orig.perc_lucro_fechamento, 0) / 100.0)::numeric AS lucro_dev_abs
+    FROM public.itens_requisicoes_devolucoes ird
+    JOIN public.requisicoes_devolucoes rd ON ird.requisicao_id = rd.requisicao_id
+    LEFT JOIN public.orcamentos o_orig ON rd.orcamento_id = o_orig.orcamento_id
+    CROSS JOIN periodo_cte p
+    WHERE ird.data_hora_alteracao::date >= p.dt_ini AND ird.data_hora_alteracao::date <= p.dt_fim
+      AND rd.empresa_id::text = ANY($1::text[])
+    GROUP BY 1
+  ),
+  realizado_cte AS (
+    SELECT v.empresa_id,
+      (COALESCE(v.valor_bruto,0) - COALESCE(d.total_dev,0) - COALESCE(v.desp_op,0))::numeric AS net_sales,
+      v.closed_budgets,
+      (COALESCE(v.lucro_vendas_abs, 0) - COALESCE(d.lucro_dev_abs, 0)) AS lucro_final_abs,
+      (COALESCE(v.base_vendas_bruta, 0) - COALESCE(d.total_dev, 0)) AS base_lucro_pres
+    FROM vendas_mes_f_cte v
+    LEFT JOIN dev_mes_f_cte d ON d.empresa_id = v.empresa_id
+  ),
+  vendas_hoje_f_cte AS (
+    SELECT o.empresa_id::text AS empresa_id,
+      SUM(COALESCE(o.valor_pedido,0))::numeric AS valor_bruto,
+      SUM(COALESCE(o.valor_outras_desp_manual,0))::numeric AS desp_op
+    FROM public.orcamentos o
+    WHERE o.data_recebimento::date = CURRENT_DATE
+      AND COALESCE(o.cancelado,'N') = 'N'
+      AND o.empresa_id::text = ANY($1::text[])
+    GROUP BY 1
+  ),
+  dev_hoje_f_cte AS (
+    SELECT rd.empresa_id::text AS empresa_id, SUM(COALESCE(ird.quantidade*ird.preco_venda,0))::numeric AS total_dev
+    FROM public.itens_requisicoes_devolucoes ird
+    JOIN public.requisicoes_devolucoes rd ON ird.requisicao_id = rd.requisicao_id
+    WHERE ird.data_hora_alteracao::date = CURRENT_DATE
+      AND rd.empresa_id::text = ANY($1::text[])
+    GROUP BY 1
+  ),
+  realizado_hoje_cte AS (
+    SELECT vh.empresa_id,
+      (COALESCE(vh.valor_bruto,0) - COALESCE(d_h.total_dev,0) - COALESCE(vh.desp_op,0))::numeric AS net_today
+    FROM vendas_hoje_f_cte vh LEFT JOIN dev_hoje_f_cte d_h ON d_h.empresa_id = vh.empresa_id
+  )
+SELECT
+  e.empresa_id::text,
+  COALESCE(e.nome_resumido,'')::text AS name,
+  COALESCE(mf.meta,0)::numeric AS goal,
+  COALESCE(rz.net_sales,0)::numeric AS realized,
+  CASE WHEN COALESCE(mf.meta,0) > 0 THEN (COALESCE(rz.net_sales,0)/mf.meta)*100 ELSE 0 END::numeric AS pct,
+  COALESCE(rh.net_today,0)::numeric AS realized_today,
+  COALESCE(rz.closed_budgets,0)::int AS closed_budgets,
+  CASE WHEN COALESCE(rz.base_lucro_pres, 0) > 0 THEN ROUND((rz.lucro_final_abs / rz.base_lucro_pres * 100.0)::numeric, 3) ELSE 0 END AS profit_pct
+FROM public.empresas e
+LEFT JOIN metas_filial_cte mf ON mf.empresa_id::text = e.empresa_id::text
+LEFT JOIN realizado_cte rz ON rz.empresa_id::text = e.empresa_id::text
+LEFT JOIN realizado_hoje_cte rh ON rh.empresa_id::text = e.empresa_id::text
+WHERE e.empresa_id::text = ANY($1::text[])
+ORDER BY pct DESC;
+`;
+
+// ---- Query vendedores ----
+const SQL_SELLERS = \`
+WITH
+  params_v_cte AS (SELECT CURRENT_DATE::date AS data_ref),
+  semana_ref_cte AS (
+    SELECT
+      date_trunc('week', pm.data_ref)::date AS semana_ini,
+      (date_trunc('week', pm.data_ref)::date + 4) AS semana_fim
+    FROM params_v_cte pm
+  ),
+  periodo_v_cte AS (
+    SELECT
+      date_trunc('month', sr.semana_ini)::date AS dt_ini,
+      (date_trunc('month', sr.semana_ini) + interval '1 month - 1 day')::date AS dt_fim,
+      (EXTRACT(YEAR FROM date_trunc('month',sr.semana_ini))::int*100 + EXTRACT(MONTH FROM date_trunc('month',sr.semana_ini))::int) AS ano_mes
+    FROM semana_ref_cte sr
+  ),
+  feriados_v_cte AS (
+    SELECT DISTINCT (SUBSTRING(feriado_id, 1, 10))::date AS d_f
+    FROM public.feriados WHERE SUBSTRING(feriado_id, 1, 10) ~ '^\\\\d{4}-\\\\d{2}-\\\\d{2}'
+  ),
+  calendario_v_cte AS (
+    SELECT
+      COUNT(*)::int AS uteis_mes,
+      COUNT(*) FILTER (WHERE ds.d <= CURRENT_DATE)::int AS uteis_corridos,
+      COUNT(*) FILTER (WHERE ds.d > CURRENT_DATE)::int AS uteis_restantes
+    FROM periodo_v_cte p 
+    CROSS JOIN LATERAL generate_series(p.dt_ini, p.dt_fim,'1 day'::interval) ds(d)
+    LEFT JOIN feriados_v_cte f ON f.d_f = ds.d::date
+    WHERE EXTRACT(DOW FROM ds.d) BETWEEN 1 AND 5 AND f.d_f IS NULL
+  ),
+  vendas_itens_v_cte AS (
+    SELECT 
+      io.orcamento_id,
+      SUM(COALESCE(io.quantidade * io.icms_medio, 0)) as icms_rs,
+      SUM(COALESCE(io.quantidade * io.credito_pis_cofins_medio, 0)) as pis_cofins_rs
+    FROM public.itens_orcamentos io
+    JOIN public.orcamentos o ON o.orcamento_id = io.orcamento_id
+    CROSS JOIN periodo_v_cte p
+    WHERE o.data_recebimento::date >= p.dt_ini AND o.data_recebimento::date <= p.dt_fim
+      AND COALESCE(o.cancelado,'N') = 'N'
+    GROUP BY 1
+  ),
+  vendas_mes_v_cte AS (
+    SELECT
+      o.vendedor_id::text AS seller_id,
+      COUNT(DISTINCT o.orcamento_id) FILTER (WHERE COALESCE(o.pedido_fechado,'N')='S')::int AS closed_budgets,
+      SUM(COALESCE(o.valor_pedido,0))::numeric AS bruto,
+      SUM(COALESCE(o.valor_pedido, 0) - COALESCE(o.valor_ipi, 0) - COALESCE(o.valor_subst_trib, 0) - COALESCE(o.valor_fcp_st, 0) - COALESCE(o.valor_outras_desp_manual, 0) - COALESCE(vi.icms_rs, 0) - COALESCE(vi.pis_cofins_rs, 0))::numeric AS bruto_base,
+      SUM((COALESCE(o.valor_pedido, 0) - COALESCE(o.valor_ipi, 0) - COALESCE(o.valor_subst_trib, 0) - COALESCE(o.valor_fcp_st, 0) - COALESCE(o.valor_outras_desp_manual, 0) - COALESCE(vi.icms_rs, 0) - COALESCE(vi.pis_cofins_rs, 0)) * COALESCE(o.perc_lucro_fechamento, 0) / 100.0)::numeric AS lucro_vendas_abs,
+      SUM(COALESCE(o.valor_outras_desp_manual,0))::numeric AS desp_op
+    FROM public.orcamentos o CROSS JOIN periodo_v_cte p
+    LEFT JOIN vendas_itens_v_cte vi ON vi.orcamento_id = o.orcamento_id
+    WHERE o.data_recebimento::date >= p.dt_ini AND o.data_recebimento::date <= p.dt_fim 
+    AND COALESCE(o.cancelado,'N')='N'
+    AND COALESCE(o.recebido,'S')='S'
+    AND o.empresa_id::text = ANY($2::text[])
+    GROUP BY 1
+  ),
+  dev_mes_v_cte AS (
+    SELECT 
+      rd.vendedor_id::text AS seller_id, 
+      SUM(COALESCE(ird.quantidade*ird.preco_venda,0))::numeric AS total_dev,
+      SUM(COALESCE(ird.quantidade*ird.preco_venda,0) * COALESCE(o_orig.perc_lucro_fechamento, 0) / 100.0)::numeric AS lucro_dev_abs
+    FROM public.itens_requisicoes_devolucoes ird
+    JOIN public.requisicoes_devolucoes rd ON ird.requisicao_id = rd.requisicao_id
+    LEFT JOIN public.orcamentos o_orig ON rd.orcamento_id = o_orig.orcamento_id
+    CROSS JOIN periodo_v_cte p
+    WHERE ird.data_hora_alteracao::date >= p.dt_ini AND ird.data_hora_alteracao::date <= p.dt_fim
+    AND rd.empresa_id::text = ANY($2::text[])
+    GROUP BY 1
+  ),
+  metas_mes_v_cte AS (
+    SELECT
+      im.funcionario_id::text AS seller_id,
+      SUM(im.meta)::numeric AS v_meta,
+      AVG(COALESCE(im.perc_lucro_meta, 0))::numeric AS perc_lucro_meta
+    FROM public.itens_metas im CROSS JOIN periodo_v_cte p
+    WHERE im.ano_mes::text = p.ano_mes::text GROUP BY 1
+  ),
+  mensal_v_cte AS (
+    SELECT
+      f.funcionario_id::text AS seller_id,
+      f.nome AS seller_name,
+      cl.uteis_mes, cl.uteis_corridos, cl.uteis_restantes,
+      COALESCE(v.closed_budgets,0)::int AS closed_budgets,
+      (COALESCE(v.bruto,0)-COALESCE(d.total_dev,0)-COALESCE(v.desp_op,0))::numeric AS net_sales,
+      (COALESCE(v.lucro_vendas_abs, 0) - COALESCE(d.lucro_dev_abs, 0)) AS lucro_final_abs,
+      (COALESCE(v.bruto_base, 0) - COALESCE(d.total_dev, 0)) AS base_lucro_pres
+    FROM public.funcionarios f
+    CROSS JOIN calendario_v_cte cl
+    LEFT JOIN vendas_mes_v_cte v ON v.seller_id = f.funcionario_id::text
+    LEFT JOIN dev_mes_v_cte d ON d.seller_id = f.funcionario_id::text
+    WHERE f.funcionario_id::text = ANY($1::text[])
+  ),
+  vendas_semana_v_cte AS (
+    SELECT o.vendedor_id::text AS seller_id,
+      SUM(COALESCE(o.valor_pedido,0)) AS bruto,
+      SUM(COALESCE(o.valor_outras_desp_manual,0)) AS desp_op,
+      COUNT(DISTINCT o.orcamento_id) FILTER (WHERE COALESCE(o.pedido_fechado,'N')='S')::int AS weekly_closed
+    FROM public.orcamentos o JOIN semana_ref_cte sr ON TRUE
+    WHERE o.data_recebimento::date BETWEEN sr.semana_ini AND sr.semana_fim
+      AND COALESCE(o.cancelado,'N')='N' AND COALESCE(o.recebido,'S')='S'
+    GROUP BY 1
+  ),
+  dev_semana_v_cte AS (
+    SELECT rd.vendedor_id::text AS seller_id, SUM(COALESCE(ird.quantidade*ird.preco_venda,0))::numeric AS total_dev
+    FROM public.itens_requisicoes_devolucoes ird
+    JOIN public.requisicoes_devolucoes rd ON ird.requisicao_id = rd.requisicao_id
+    CROSS JOIN semana_ref_cte sr ON TRUE
+    WHERE ird.data_hora_alteracao::date BETWEEN sr.semana_ini AND sr.semana_fim
+    GROUP BY 1
+  ),
+  metas_semana_v_cte AS (
+    SELECT ms.vendedor_id::text AS seller_id, SUM(COALESCE(ms.valor_meta,0))::numeric AS meta
+    FROM public.metas_semanal ms JOIN semana_ref_cte sr ON ms.data_inicio::date <= sr.semana_ini AND ms.data_fim::date >= sr.semana_fim
+    GROUP BY 1
+  ),
+  carteira_base_v_cte AS (
+    SELECT c.funcionario_id::text AS seller_id, c.cadastro_id::text AS cliente_id
+    FROM public.clientes c
+    WHERE COALESCE(c.cliente_ativo,'S') <> 'N' AND c.funcionario_id IS NOT NULL
+      AND c.funcionario_id::text = ANY($1::text[])
+  ),
+  last_sale_v_cte AS (
+    SELECT o.vendedor_id::text AS seller_id, o.cadastro_id::text AS cliente_id
+    FROM public.orcamentos o CROSS JOIN periodo_v_cte p
+    WHERE o.pedido_fechado='S' AND COALESCE(o.cancelado,'N')='N'
+      AND o.data_recebimento::date >= p.dt_ini AND o.data_recebimento::date <= p.dt_fim
+      AND o.vendedor_id IS NOT NULL AND o.cadastro_id IS NOT NULL
+    GROUP BY 1,2
+  ),
+  final_v_cte AS (
+    SELECT
+      m.seller_id, m.seller_name, m.uteis_mes, m.uteis_corridos, m.uteis_restantes, m.closed_budgets, m.net_sales,
+      COALESCE(mm.v_meta, 0) as goal_meta,
+      COALESCE(mm.perc_lucro_meta, 0) as perc_lucro_meta,
+      m.lucro_final_abs,
+      CASE WHEN m.base_lucro_pres > 0 THEN ROUND((m.lucro_final_abs / m.base_lucro_pres * 100.0)::numeric, 2) ELSE 0 END AS profit_pct,
+      (COALESCE(vs.bruto,0) - COALESCE(ds.total_dev,0) - COALESCE(vs.desp_op,0))::numeric AS weekly_realized,
+      COALESCE(vs.weekly_closed, 0) as weekly_closed,
+      COALESCE(msw.meta, 0) as weekly_meta_val
+    FROM mensal_v_cte m
+    LEFT JOIN metas_mes_v_cte mm ON mm.seller_id = m.seller_id
+    LEFT JOIN vendas_semana_v_cte vs ON vs.seller_id = m.seller_id
+    LEFT JOIN dev_semana_v_cte ds ON ds.seller_id = m.seller_id
+    LEFT JOIN metas_semana_v_cte msw ON msw.seller_id = m.seller_id
+  )
+SELECT
+  f.seller_id, f.seller_name, f.goal_meta, f.net_sales,
+  CASE WHEN f.goal_meta > 0 THEN (f.net_sales/f.goal_meta)*100 ELSE 0 END AS pct_achieved,
+  f.profit_pct,
+  f.perc_lucro_meta as profit_meta_pct,
+  f.closed_budgets,
+  f.weekly_meta_val AS weekly_meta,
+  f.weekly_realized,
+  CASE WHEN f.weekly_meta_val > 0 THEN (f.weekly_realized/f.weekly_meta_val)*100 ELSE 0 END AS weekly_pct,
+  CASE WHEN f.weekly_realized >= f.weekly_meta_val AND f.weekly_meta_val > 0
+    THEN ROUND((f.weekly_realized*0.0005)::numeric,2)
+    ELSE 0 END AS weekly_bonus,
+  f.weekly_closed AS weekly_closed_budgets,
+  COUNT(DISTINCT cwb.cliente_id)::int AS wallet_total,
+  COUNT(DISTINCT lsv.cliente_id)::int AS wallet_positive_month,
+  CASE WHEN COUNT(DISTINCT cwb.cliente_id)>0 THEN ROUND((COUNT(DISTINCT lsv.cliente_id)::numeric / COUNT(DISTINCT cwb.cliente_id)::numeric * 100)::numeric, 2) ELSE 0 END AS wallet_positive_pct
+FROM final_v_cte f
+LEFT JOIN carteira_base_v_cte cwb ON cwb.seller_id = f.seller_id
+LEFT JOIN last_sale_v_cte lsv ON lsv.seller_id = f.seller_id AND lsv.cliente_id = cwb.cliente_id
+WHERE f.goal_meta > 0 OR f.net_sales <> 0
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13
+ORDER BY weekly_pct DESC, weekly_realized DESC, net_sales DESC;
+\`;
+
+const SQL_DIAS = \`
+WITH periodo_d_cte AS (
+  SELECT
+    date_trunc('month', CURRENT_DATE)::date AS dt_ini,
+    (date_trunc('month', CURRENT_DATE) + interval '1 month - 1 day')::date AS dt_fim
+),
+feriados_cte AS (
+  SELECT DISTINCT (SUBSTRING(feriado_id, 1, 10))::date AS data_feriado
+  FROM public.feriados
+  WHERE SUBSTRING(feriado_id, 1, 10) ~ '^\\\\d{4}-\\\\d{2}-\\\\d{2}'
+),
+dias_serie AS (
+  SELECT d::date AS data_dia
+  FROM periodo_d_cte p CROSS JOIN LATERAL generate_series(p.dt_ini, p.dt_fim, '1 day'::interval) d
+),
+dias_uteis AS (
+  SELECT ds.data_dia
+  FROM dias_serie ds
+  LEFT JOIN feriados_cte f ON f.data_feriado = ds.data_dia
+  WHERE EXTRACT(DOW FROM ds.data_dia) BETWEEN 1 AND 5 -- Seg a Sex
+    AND f.data_feriado IS NULL -- Não é feriado
+)
+SELECT
+  COUNT(*)::int AS uteis_mes,
+  COUNT(*) FILTER (WHERE data_dia <= CURRENT_DATE)::int AS uteis_corridos,
+  COUNT(*) FILTER (WHERE data_dia > CURRENT_DATE)::int AS uteis_restantes
+FROM dias_uteis;
+\`;
+
+const SQL_LUCRO = \`
+WITH
+  periodo_l_cte AS (
+    SELECT
+      date_trunc('month', CURRENT_DATE)::date AS dt_ini,
+      (date_trunc('month', CURRENT_DATE) + interval '1 month - 1 day')::date AS dt_fim
+  ),
+  vendas_itens_l_cte AS (
+    SELECT 
+      io.orcamento_id,
+      SUM(COALESCE(io.quantidade * io.icms_medio, 0)) as icms_rs,
+      SUM(COALESCE(io.quantidade * io.credito_pis_cofins_medio, 0)) as pis_cofins_rs
+    FROM public.itens_orcamentos io
+    JOIN public.orcamentos o ON o.orcamento_id = io.orcamento_id
+    CROSS JOIN periodo_l_cte p
+    WHERE o.data_recebimento::date >= p.dt_ini AND o.data_recebimento::date <= p.dt_fim
+      AND COALESCE(o.cancelado,'N') = 'N'
+    GROUP BY 1
+  ),
+  vendas_l_cte AS (
+    SELECT
+      SUM(COALESCE(o.valor_pedido, 0) - COALESCE(o.valor_ipi, 0) - COALESCE(o.valor_subst_trib, 0) - COALESCE(o.valor_fcp_st, 0) - COALESCE(o.valor_outras_desp_manual, 0) - COALESCE(vi.icms_rs, 0) - COALESCE(vi.pis_cofins_rs, 0)) AS base_vendas_bruta,
+      SUM((COALESCE(o.valor_pedido, 0) - COALESCE(o.valor_ipi, 0) - COALESCE(o.valor_subst_trib, 0) - COALESCE(o.valor_fcp_st, 0) - COALESCE(o.valor_outras_desp_manual, 0) - COALESCE(vi.icms_rs, 0) - COALESCE(vi.pis_cofins_rs, 0)) * COALESCE(o.perc_lucro_fechamento, 0) / 100.0) AS lucro_vendas_bruto,
+      SUM(CASE WHEN o.data_recebimento::date = CURRENT_DATE THEN (COALESCE(o.valor_pedido, 0) - COALESCE(o.valor_ipi, 0) - COALESCE(o.valor_subst_trib, 0) - COALESCE(o.valor_fcp_st, 0) - COALESCE(o.valor_outras_desp_manual, 0) - COALESCE(vi.icms_rs, 0) - COALESCE(vi.pis_cofins_rs, 0)) * COALESCE(o.perc_lucro_fechamento, 0) / 100.0 ELSE 0 END) AS lucro_vendas_hoje
+    FROM public.orcamentos o
+    LEFT JOIN vendas_itens_l_cte vi ON vi.orcamento_id = o.orcamento_id
+    CROSS JOIN periodo_l_cte p
+    WHERE o.data_recebimento::date >= p.dt_ini AND o.data_recebimento::date <= p.dt_fim
+      AND COALESCE(o.cancelado,'N') = 'N'
+      AND COALESCE(o.recebido,'S') = 'S'
+      AND o.empresa_id::text = ANY($1::text[])
+  ),
+  dev_l_cte AS (
+    SELECT 
+      SUM(COALESCE(ird.quantidade*ird.preco_venda,0))::numeric AS total_dev_mes,
+      SUM(COALESCE(ird.quantidade*ird.preco_venda,0) * COALESCE(o_orig.perc_lucro_fechamento, 0) / 100.0)::numeric AS lucro_dev_mes
+    FROM public.itens_requisicoes_devolucoes ird
+    JOIN public.requisicoes_devolucoes rd ON ird.requisicao_id = rd.requisicao_id
+    LEFT JOIN public.orcamentos o_orig ON rd.orcamento_id = o_orig.orcamento_id
+    CROSS JOIN periodo_l_cte p
+    WHERE ird.data_hora_alteracao::date >= p.dt_ini AND ird.data_hora_alteracao::date <= p.dt_fim
+      AND rd.empresa_id::text = ANY($1::text[])
+  ),
+  summary_cte AS (
+    SELECT
+      (COALESCE(v.lucro_vendas_bruto, 0) - COALESCE(d.lucro_dev_mes, 0)) AS lucro_mes,
+      COALESCE(v.lucro_vendas_hoje, 0) AS lucro_hoje,
+      (COALESCE(v.base_vendas_bruta, 0) - COALESCE(d.total_dev_mes, 0)) AS base_lucro_presente_consolidada
+    FROM vendas_l_cte v, dev_l_cte d
+  )
+SELECT
+  lucro_mes::numeric,
+  lucro_hoje::numeric,
+  CASE WHEN base_lucro_presente_consolidada > 0 THEN
+    ROUND((lucro_mes / base_lucro_presente_consolidada * 100.0)::numeric, 3)
+  ELSE 0 END AS perc_lucro_mes
+FROM summary_cte;
+\`;
+
+export async function getTVDashboardData(): Promise<TVDashboardData> {
+  const [filiaisRes, sellersRes, diasRes, lucroRes] = await Promise.all([
+    pool.query(SQL_FILIAIS, [EMPRESA_IDS]),
+    pool.query(SQL_SELLERS, [SELLER_IDS, EMPRESA_IDS]),
+    pool.query(SQL_DIAS),
+    pool.query(SQL_LUCRO, [EMPRESA_IDS]),
+  ]).catch(err => {
+    console.error("Critical DB error in getTVDashboardData:", err);
+    throw err;
+  });
+
+  const filiais = filiaisRes.rows.map((r) => ({
+    empresa_id: Number(r.empresa_id),
+    name: String(r.name),
+    goal: toNum(r.goal),
+    realized: toNum(r.realized),
+    pct: toNum(r.pct),
+    realized_today: toNum(r.realized_today),
+    closed_budgets: Number(r.closed_budgets ?? 0),
+    profit_pct: toNum(r.profit_pct),
+  }));
+
+  const sellers = sellersRes.rows.map((r) => ({
+    seller_id: Number(r.seller_id),
+    seller_name: String(r.seller_name ?? ""),
+    goal_meta: toNum(r.goal_meta),
+    net_sales: toNum(r.net_sales),
+    pct_achieved: toNum(r.pct_achieved),
+    closed_budgets: Number(r.closed_budgets ?? 0),
+    weekly_meta: toNum(r.weekly_meta),
+    weekly_realized: toNum(r.weekly_realized),
+    weekly_pct_achieved: toNum(r.weekly_pct),
+    weekly_bonus: toNum(r.weekly_bonus),
+    weekly_closed_budgets: Number(r.weekly_closed_budgets ?? 0),
+    wallet_total: Number(r.wallet_total ?? 0),
+    wallet_positive_month: Number(r.wallet_positive_month ?? 0),
+    wallet_positive_pct: toNum(r.wallet_positive_pct),
+    profit_pct: toNum(r.profit_pct),
+    profit_meta_pct: toNum(r.profit_meta_pct),
+  }));
+
+  const totalRealized = filiais.reduce((s, f) => s + f.realized, 0);
+  const totalGoal = filiais.reduce((s, f) => s + f.goal, 0);
+  const totalClosedBudgets = filiais.reduce((s, f) => s + f.closed_budgets, 0);
+  const todayRealized = filiais.reduce((s, f) => s + f.realized_today, 0);
+  const totalPct = totalGoal > 0 ? (totalRealized / totalGoal) * 100 : 0;
+
+  const walletTotals = sellers.reduce((s, r) => s + r.wallet_total, 0);
+  const walletPos = sellers.reduce((s, r) => s + r.wallet_positive_month, 0);
+  const positivacaoPct = walletTotals > 0 ? (walletPos / walletTotals) * 100 : 0;
+  const dias = diasRes.rows[0];
+
+  const lucroRow = lucroRes.rows[0];
+  const totalProfitMonth = toNum(lucroRow?.lucro_mes);
+  const totalProfitToday = toNum(lucroRow?.lucro_hoje);
+  const totalProfitPct = toNum(lucroRow?.perc_lucro_mes);
+
+  let lastSync = { start: "", end: "" };
+  try {
+    const { Client } = await import("ssh2");
+    const conn = new Client();
+    await new Promise<void>((resolve, reject) => {
+      conn
+        .on("ready", () => {
+          conn.exec(
+            "grep 'Início:' /root/migracao/log_migracao.log | tail -n 1; grep 'Fim:' /root/migracao/log_migracao.log | tail -n 1",
+            (err: Error | undefined, stream: import("ssh2").ClientChannel) => {
+              if (err) {
+                conn.end();
+                return reject(err);
+              }
+              let out = "";
+              stream
+                .on("close", () => {
+                  conn.end();
+                  const matchStart = out.match(/Início:\\s*(.*)/);
+                  const matchEnd = out.match(/Fim:\\s*(.*)/);
+                  if (matchStart?.[1]) lastSync.start = matchStart[1].trim();
+                  if (matchEnd?.[1]) lastSync.end = matchEnd[1].trim();
+                  resolve();
+                })
+                .on("data", (data: any) => {
+                  out += data.toString();
+                });
+            }
+          );
+        })
+        .on("error", (err: any) => reject(err))
+        .connect({
+          host: "172.16.0.32",
+          port: 22,
+          username: "root",
+          password: process.env.SSH_PASSWORD || "121279",
+          readyTimeout: 3000,
+        });
+    });
+  } catch (err) {
+    console.error("Failed to read last sync info via SSH", err);
+  }
+
+  return {
+    updatedAt: new Date().toISOString(),
+    totalGoal,
+    totalRealized,
+    totalPct,
+    totalClosedBudgets,
+    todayRealized,
+    businessDaysMonth: Number(dias?.uteis_mes ?? 0),
+    businessDaysElapsed: Number(dias?.uteis_corridos ?? 0),
+    businessDaysRemaining: Number(dias?.uteis_restantes ?? 0),
+    filiais,
+    sellers,
+    positivacaoPct,
+    positivacaoTotal: walletTotals,
+    positivacaoPositive: walletPos,
+    totalProfitMonth,
+    totalProfitToday,
+    totalProfitPct,
+    lastSync: lastSync.start || lastSync.end ? lastSync : undefined,
+  };
+}

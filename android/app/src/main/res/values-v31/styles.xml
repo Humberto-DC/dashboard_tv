@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Tema para a SplashActivity no Android 12+ -->
+    <style name="Theme.App.SplashScreen" parent="Theme.SplashScreen">
+        <!-- Ícone central transparente para não aparecer o robô -->
+        <item name="windowSplashScreenAnimatedIcon">@android:color/transparent</item>
+        <!-- Cor de fundo que combina com sua arte -->
+        <item name="windowSplashScreenBackground">#061d33</item>
+        <!-- Tema que assume depois -->
+        <item name="postSplashScreenTheme">@style/AppTheme</item>
+    </style>
+</resources>

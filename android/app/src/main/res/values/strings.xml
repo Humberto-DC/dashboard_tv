@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Conecta360</string>
+    <string name="title_activity_main">Conecta360</string>
+    <string name="package_name">com.conecta360.dashboardtv</string>
+    <string name="custom_url_scheme">com.conecta360.dashboardtv</string>
+</resources>
