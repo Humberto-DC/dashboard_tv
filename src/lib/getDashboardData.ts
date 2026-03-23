@@ -15,67 +15,47 @@ WITH
     GROUP BY m.empresa_id
   ),
   vendas_base AS (
-    SELECT * FROM (
-        SELECT
-          e.empresa_id AS eid,
-          o.data_recebimento as dt,
-          (o.valor_produtos - o.valor_desconto) AS v_prod,
-          COALESCE(o.valor_outras_despesas, 0) AS v_outros,
-          COALESCE(o.valor_frete_processado, 0) AS v_frete,
-          COALESCE(o.valor_pedido, 0) AS v_pedido,
-          1 as cnt_v,
-          (o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id)) AS bs,
-          ((o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id)) * (o.perc_lucro_fechamento / 100.0)) AS luc,
-          0 as real_dev,
-          0 as bs_d, 0 as luc_d
-        FROM ADM.orcamentos o
-        JOIN ADM.empresas e ON e.empresa_id = o.empresa_id
-        WHERE TRUNC(o.data_recebimento) >= TRUNC(SYSDATE, 'MM')
-          AND o.data_recebimento IS NOT NULL 
-          AND COALESCE(o.cancelado,'N') = 'N'
-          AND o.empresa_id IN (1, 2, 3, 5, 6) 
-          AND (o.pedido_fechado = 'S' OR o.recebido = 'S')
-        UNION ALL
-        SELECT
-          n.empresa_id, n.data_emissao, 
-          0 as v_prod,
-          0 as v_outros,
-          0 as v_frete,
-          0 as v_pedido,
-          0 as cnt_v,
-          0 as bs, 0 as luc,
-          n.valor_produtos as real_dev,
-          n.valor_produtos as bs_d, (n.valor_produtos * 0.09) as luc_d
-        FROM ADM.notas_fiscais n
-        WHERE TRUNC(n.data_emissao) >= TRUNC(SYSDATE, 'MM')
-          AND n.empresa_id IN (1, 2, 3, 5, 6)
-          AND (n.devolucao_id IS NOT NULL OR n.cfop_id IN ('1.201', '1.202', '1.410', '1.411', '2.201', '2.202', '2.410', '2.411'))
-    )
+    SELECT
+      o.empresa_id AS eid,
+      o.data_recebimento as dt,
+      (o.valor_produtos - o.valor_desconto) AS v_prod,
+      COALESCE(o.valor_outras_despesas, 0) AS v_outros,
+      COALESCE(o.valor_frete_processado, 0) AS v_frete,
+      COALESCE(o.valor_frete_cif_embutido, 0) AS v_frete_cif,
+      COALESCE(o.valor_pedido, 0) AS v_pedido,
+      (o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id) - COALESCE(o.valor_frete_cif_embutido, 0)) AS bs,
+      ((o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id) - COALESCE(o.valor_frete_cif_embutido, 0)) * (o.perc_lucro_fechamento / 100.0)) AS luc
+    FROM ADM.orcamentos o
+    WHERE TRUNC(o.data_recebimento) >= TRUNC(SYSDATE, 'MM')
+      AND o.data_recebimento IS NOT NULL 
+      AND COALESCE(o.cancelado,'N') = 'N'
+      AND o.empresa_id IN (1, 2, 3, 5, 6) 
+      AND (o.pedido_fechado = 'S' OR o.recebido = 'S')
   ),
   vendas_f_final AS (
     SELECT
       eid,
       SUM(v_prod) AS total_prod_gross,
-      SUM(real_dev) AS total_return,
       SUM(v_frete) AS total_frete,
       SUM(v_outros) AS total_outros,
-      -- Realizado = valor_pedido - outras_despesas (conforme regra exata solicitada)
       SUM(v_pedido - v_outros) AS realized_liq,
-      SUM(cnt_v) AS closed_budgets,
-      SUM(bs - bs_d) AS base_lucro_pres,
-      SUM(luc - luc_d) AS lucro_abs,
+      COUNT(DISTINCT eid) AS closed_budgets,
+      SUM(bs) AS base_vendas,
+      SUM(luc) AS lucro_vendas,
       SUM(CASE WHEN TRUNC(dt) = TRUNC(SYSDATE) THEN v_pedido - v_outros ELSE 0 END) AS realized_today_gross,
-      SUM(CASE WHEN TRUNC(dt) = TRUNC(SYSDATE) THEN cnt_v ELSE 0 END) AS today_closed_budgets,
-      SUM(CASE WHEN TRUNC(dt) = TRUNC(SYSDATE) THEN luc - luc_d ELSE 0 END) AS lucro_hoje_abs
+      SUM(CASE WHEN TRUNC(dt) = TRUNC(SYSDATE) THEN 1 ELSE 0 END) AS today_closed_budgets,
+      SUM(CASE WHEN TRUNC(dt) = TRUNC(SYSDATE) THEN luc ELSE 0 END) AS lucro_hoje_vendas
     FROM vendas_base
     GROUP BY eid
   ),
   dev_req_f AS (
-    -- Devoluções confirmadas (STATUS='B') em ADM.REQUISICOES_DEVOLUCOES por filial
     SELECT
       d.empresa_id AS eid,
-      SUM(d.valor_devolucao) AS v_dev_req,
-      SUM(CASE WHEN TRUNC(d.data_devolucao) = TRUNC(SYSDATE) THEN d.valor_devolucao ELSE 0 END) AS v_dev_req_hoje
+      SUM(d.valor_produtos - d.valor_desconto) AS v_dev_liq,
+      SUM(d.valor_produtos - d.valor_desconto - COALESCE(d.valor_total_retencao_fin, 0) - COALESCE(d.valor_juros_embutidos, 0)) AS bs_dev,
+      SUM((d.valor_produtos - d.valor_desconto - COALESCE(d.valor_total_retencao_fin, 0) - COALESCE(d.valor_juros_embutidos, 0)) * 0.09) AS luc_dev,
+      SUM(CASE WHEN TRUNC(d.data_devolucao) = TRUNC(SYSDATE) THEN (d.valor_produtos - d.valor_desconto) ELSE 0 END) AS v_dev_hoje,
+      SUM(CASE WHEN TRUNC(d.data_devolucao) = TRUNC(SYSDATE) THEN (d.valor_produtos - d.valor_desconto - COALESCE(d.valor_total_retencao_fin, 0) - COALESCE(d.valor_juros_embutidos, 0)) * 0.09 ELSE 0 END) AS luc_dev_hoje
     FROM ADM.requisicoes_devolucoes d
     WHERE TRUNC(d.data_devolucao) >= TRUNC(SYSDATE, 'MM')
       AND d.empresa_id IN (1, 2, 3, 5, 6)
@@ -84,20 +64,21 @@ WITH
   )
 SELECT
   e.empresa_id, COALESCE(e.nome_resumido, '') AS name, COALESCE(mf.meta, 0) AS goal,
-  CASE WHEN COALESCE(rz.base_lucro_pres, 0) > 0 THEN (COALESCE(rz.lucro_abs, 0) / rz.base_lucro_pres * 100.0) ELSE 0 END AS profit_pct,
-  COALESCE(rz.lucro_abs, 0) AS lucro_abs,
-  COALESCE(rz.base_lucro_pres, 0) AS base_lucro_pres,
-  -- Hoje: vendas do dia menos devoluções do dia
-  GREATEST(COALESCE(rz.realized_today_gross, 0) - COALESCE(dr.v_dev_req_hoje, 0), 0) AS realized_today,
+  COALESCE(rz.base_vendas, 0) - COALESCE(dr.bs_dev, 0) AS base_lucro_pres,
+  COALESCE(rz.lucro_vendas, 0) - COALESCE(dr.luc_dev, 0) AS lucro_abs,
+  CASE WHEN (COALESCE(rz.base_vendas, 0) - COALESCE(dr.bs_dev, 0)) > 0 
+       THEN ((COALESCE(rz.lucro_vendas, 0) - COALESCE(dr.luc_dev, 0)) / (COALESCE(rz.base_vendas, 0) - COALESCE(dr.bs_dev, 0)) * 100.0) 
+       ELSE 0 
+  END AS profit_pct,
+  COALESCE(rz.realized_today_gross, 0) - COALESCE(dr.v_dev_hoje, 0) AS realized_today,
   COALESCE(rz.closed_budgets, 0) AS closed_budgets,
   COALESCE(rz.today_closed_budgets, 0) AS today_closed_budgets,
-  COALESCE(rz.lucro_hoje_abs, 0) AS lucro_hoje_abs,
+  COALESCE(rz.lucro_hoje_vendas, 0) - COALESCE(dr.luc_dev_hoje, 0) AS lucro_hoje_abs,
   COALESCE(rz.total_prod_gross, 0) AS products_gross,
-  COALESCE(rz.total_return, 0) AS return_val,
+  COALESCE(dr.v_dev_liq, 0) AS return_val,
   COALESCE(rz.total_frete, 0) AS frete_val,
   COALESCE(rz.total_outros, 0) AS outros_val,
-  -- Realizado Liq = valor_prod - desconto - devoluçoes(REQUISICOES STATUS='B')
-  GREATEST(COALESCE(rz.realized_liq, 0) - COALESCE(dr.v_dev_req, 0), 0) AS realized_liq
+  COALESCE(rz.realized_liq, 0) - COALESCE(dr.v_dev_liq, 0) AS realized_liq
 FROM ADM.empresas e
 LEFT JOIN metas_filial_cte mf ON mf.empresa_id = e.empresa_id
 LEFT JOIN vendas_f_final rz ON rz.eid = e.empresa_id
@@ -108,66 +89,71 @@ ORDER BY e.empresa_id
 
 const SQL_SELLERS = `
 WITH
-  orc_unico_v AS (
-    SELECT * FROM (
-      SELECT 
-        o.orcamento_id, o.vendedor_id, o.empresa_id, o.pedido_fechado, o.recebido, o.data_recebimento, o.data_cadastro,
-        (o.valor_produtos - o.valor_desconto) AS v_prod,
-        COALESCE(o.valor_outras_despesas, 0) AS v_outros,
-        COALESCE(o.valor_frete_processado, 0) AS v_frete,
-        COALESCE(o.valor_pedido, 0) AS v_pedido,
-        (o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id)) AS bs_l_pres,
-        COALESCE(o.perc_lucro_fechamento, 0) AS p_lucro,
-        ROW_NUMBER() OVER (PARTITION BY o.orcamento_id ORDER BY o.empresa_id) as rn
-      FROM ADM.orcamentos o
-      WHERE TRUNC(o.data_recebimento) >= TRUNC(SYSDATE, 'MM')
-        AND o.data_recebimento IS NOT NULL 
-        AND COALESCE(o.cancelado,'N') = 'N'
-        AND o.empresa_id IN (1, 2, 3, 5, 6)
-    ) WHERE rn = 1
+  orc_vendas AS (
+    SELECT 
+      o.orcamento_id, o.vendedor_id, o.empresa_id, o.data_recebimento,
+      (o.valor_produtos - o.valor_desconto) AS v_prod,
+      COALESCE(o.valor_outras_despesas, 0) AS v_outros,
+      COALESCE(o.valor_pedido, 0) AS v_pedido,
+      (o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id) - COALESCE(o.valor_frete_cif_embutido, 0)) AS bs,
+      ((o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id) - COALESCE(o.valor_frete_cif_embutido, 0)) * (o.perc_lucro_fechamento / 100.0)) AS luc
+    FROM ADM.orcamentos o
+    WHERE TRUNC(o.data_recebimento) >= TRUNC(SYSDATE, 'MM')
+      AND o.data_recebimento IS NOT NULL 
+      AND COALESCE(o.cancelado,'N') = 'N'
+      AND o.empresa_id IN (1, 2, 3, 5, 6)
+      AND (o.pedido_fechado = 'S' OR o.recebido = 'S')
   ),
-  vendas_v_base AS (
+  dev_vendas AS (
     SELECT
-      v_u.vendedor_id AS seller_id,
-      v_u.data_recebimento as dt_rec,
-      v_u.data_cadastro as dt_cad,
-      v_u.orcamento_id,
-      v_u.v_prod,
-      v_u.v_outros,
-      v_u.v_frete,
-      v_u.v_pedido,
-      v_u.bs_l_pres,
-      v_u.p_lucro,
-      0 as real_dev,
-      0 as bs_d, 0 as luc_d
-    FROM orc_unico_v v_u
-    WHERE (v_u.pedido_fechado = 'S' OR v_u.recebido = 'S')
-    UNION ALL
-    SELECT
-      o.vendedor_id, n.data_emissao, n.data_emissao, 0, 0, 0, 0, 0,
-      0, 0,
-      n.valor_produtos as real_dev,
-      n.valor_produtos as bs_d, (n.valor_produtos * 0.09) as luc_d
-    FROM ADM.notas_fiscais n
-    JOIN ADM.orcamentos o ON o.orcamento_id = n.orcamento_base_id
-    WHERE TRUNC(n.data_emissao) >= TRUNC(SYSDATE, 'MM')
-      AND n.empresa_id IN (1, 2, 3, 5, 6)
-      AND (n.devolucao_id IS NOT NULL OR n.cfop_id IN ('1.201', '1.202', '1.410', '1.411', '2.201', '2.202', '2.410', '2.411'))
+      d.vendedor_id,
+      d.data_devolucao,
+      (d.valor_produtos - d.valor_desconto) AS dev_liq,
+      (d.valor_produtos - d.valor_desconto - COALESCE(d.valor_total_retencao_fin, 0) - COALESCE(d.valor_juros_embutidos, 0)) AS bs_dev,
+      ((d.valor_produtos - d.valor_desconto - COALESCE(d.valor_total_retencao_fin, 0) - COALESCE(d.valor_juros_embutidos, 0)) * 0.09) AS luc_dev
+    FROM ADM.requisicoes_devolucoes d
+    WHERE TRUNC(d.data_devolucao) >= TRUNC(SYSDATE, 'MM')
+      AND d.empresa_id IN (1, 2, 3, 5, 6)
+      AND d.status = 'B'
   ),
   vendas_v_final AS (
     SELECT
       seller_id,
-      COUNT(DISTINCT orcamento_id) AS closed_budgets,
-      -- Realizado = valor_pedido - outras_despesas (conforme regra exata solicitada)
-      SUM(v_pedido - v_outros) AS realized_gross,
-      SUM(v_pedido - v_outros) AS realized_liq,
-      SUM(bs_l_pres - bs_d) AS base_lucro_pres,
-      SUM((bs_l_pres * (p_lucro / 100.0)) - luc_d) AS lucro_abs,
-      SUM(CASE WHEN TRUNC(dt_rec) = TRUNC(SYSDATE) THEN v_pedido - v_outros ELSE 0 END) AS realized_today,
-      COUNT(DISTINCT CASE WHEN TRUNC(dt_rec) = TRUNC(SYSDATE) THEN orcamento_id END) AS today_closed_budgets,
-      SUM(CASE WHEN TRUNC(dt_rec) >= TRUNC(SYSDATE, 'IW') THEN v_pedido - v_outros ELSE 0 END) AS realized_weekly,
-      COUNT(DISTINCT CASE WHEN TRUNC(dt_rec) >= TRUNC(SYSDATE, 'IW') THEN orcamento_id END) AS weekly_closed_budgets
-    FROM vendas_v_base
+      SUM(closed_budgets) AS closed_budgets,
+      SUM(realized_liq) AS net_sales,
+      SUM(bs_final) AS base_lucro_pres,
+      SUM(luc_final) AS profit_abs,
+      SUM(today_realized) AS realized_today,
+      SUM(today_closed) AS today_closed_budgets,
+      SUM(weekly_realized) AS realized_weekly,
+      SUM(weekly_closed) AS weekly_closed_budgets
+    FROM (
+      SELECT 
+        vendedor_id AS seller_id,
+        COUNT(DISTINCT orcamento_id) AS closed_budgets,
+        SUM(v_pedido - v_outros) AS realized_liq,
+        SUM(bs) AS bs_final,
+        SUM(luc) AS luc_final,
+        SUM(CASE WHEN TRUNC(data_recebimento) = TRUNC(SYSDATE) THEN v_pedido - v_outros ELSE 0 END) AS today_realized,
+        SUM(CASE WHEN TRUNC(data_recebimento) = TRUNC(SYSDATE) THEN 1 ELSE 0 END) AS today_closed,
+        SUM(CASE WHEN TRUNC(data_recebimento) >= TRUNC(SYSDATE, 'IW') THEN v_pedido - v_outros ELSE 0 END) AS weekly_realized,
+        SUM(CASE WHEN TRUNC(data_recebimento) >= TRUNC(SYSDATE, 'IW') THEN 1 ELSE 0 END) AS weekly_closed
+      FROM orc_vendas
+      GROUP BY vendedor_id
+      UNION ALL
+      SELECT
+        vendedor_id,
+        0,
+        -SUM(dev_liq),
+        -SUM(bs_dev),
+        -SUM(luc_dev),
+        -SUM(CASE WHEN TRUNC(data_devolucao) = TRUNC(SYSDATE) THEN dev_liq ELSE 0 END),
+        0,
+        -SUM(CASE WHEN TRUNC(data_devolucao) >= TRUNC(SYSDATE, 'IW') THEN dev_liq ELSE 0 END),
+        0
+      FROM dev_vendas
+      GROUP BY vendedor_id
+    )
     GROUP BY seller_id
   ),
   metas_v_cte AS (
@@ -183,55 +169,34 @@ WITH
     GROUP BY cl.funcionario_id
   ),
   positivacao_v_cte AS (
-    -- Positivação filtrada: conta apenas clientes onde o vendedor do orçamento
-    -- é o mesmo funcionario_id registrado no cadastro fixo do cliente (carteira oficial)
     SELECT o.vendedor_id AS seller_id, COUNT(DISTINCT o.cadastro_id) AS clientes_positivados
     FROM ADM.orcamentos o
-    -- JOIN garante que o cliente pertence à carteira oficial do vendedor
-    INNER JOIN ADM.clientes cl
-      ON cl.cadastro_id = o.cadastro_id
-     AND cl.funcionario_id = o.vendedor_id
-     AND cl.cliente_ativo <> 'N'
+    INNER JOIN ADM.clientes cl ON cl.cadastro_id = o.cadastro_id AND cl.funcionario_id = o.vendedor_id AND cl.cliente_ativo <> 'N'
     WHERE TRUNC(o.data_recebimento) >= TRUNC(SYSDATE, 'MM')
       AND o.data_recebimento IS NOT NULL 
       AND (o.pedido_fechado = 'S' OR o.recebido = 'S')
       AND COALESCE(o.cancelado,'N') = 'N'
       AND o.vendedor_id IN (244, 12, 17, 67, 200, 110, 193, 114, 215, 108, 163, 46)
     GROUP BY o.vendedor_id
-  ),
-  dev_req_v AS (
-    -- Devoluções confirmadas (STATUS='B') em ADM.REQUISICOES_DEVOLUCOES por vendedor
-    SELECT
-      d.vendedor_id AS seller_id,
-      SUM(d.valor_devolucao) AS v_dev_req,
-      SUM(CASE WHEN TRUNC(d.data_devolucao) = TRUNC(SYSDATE) THEN d.valor_devolucao ELSE 0 END) AS v_dev_req_hoje,
-      SUM(CASE WHEN TRUNC(d.data_devolucao) >= TRUNC(SYSDATE, 'IW') THEN d.valor_devolucao ELSE 0 END) AS v_dev_req_semana
-    FROM ADM.requisicoes_devolucoes d
-    WHERE TRUNC(d.data_devolucao) >= TRUNC(SYSDATE, 'MM')
-      AND d.empresa_id IN (1, 2, 3, 5, 6)
-      AND d.status = 'B'
-    GROUP BY d.vendedor_id
   )
 SELECT
   f.funcionario_id AS seller_id, f.nome AS seller_name, COALESCE(mm.v_meta, 0) as goal_meta,
-  -- Realizado líquido com devoluções descontadas
-  GREATEST(COALESCE(v.realized_gross, 0) - COALESCE(dr.v_dev_req, 0), 0) AS net_sales,
-  CASE WHEN COALESCE(v.base_lucro_pres, 0) > 0 THEN (COALESCE(v.lucro_abs, 0) / v.base_lucro_pres * 100.0) ELSE 0 END AS profit_pct,
+  COALESCE(v.net_sales, 0) AS net_sales,
+  CASE WHEN COALESCE(v.base_lucro_pres, 0) > 0 THEN (COALESCE(v.profit_abs, 0) / v.base_lucro_pres * 100.0) ELSE 0 END AS profit_pct,
   COALESCE(mm.perc_lucro_meta, 0) as profit_meta_pct,
-  COALESCE(v.lucro_abs, 0) as profit_abs,
+  COALESCE(v.profit_abs, 0) as profit_abs,
   COALESCE(v.closed_budgets, 0) as closed_budgets,
   COALESCE(cw.total_clientes, 0) AS wallet_total,
   COALESCE(pv.clientes_positivados, 0) AS wallet_positive_month,
-  GREATEST(COALESCE(v.realized_today, 0) - COALESCE(dr.v_dev_req_hoje, 0), 0) AS realized_today,
+  COALESCE(v.realized_today, 0) AS realized_today,
   COALESCE(v.today_closed_budgets, 0) AS today_closed_budgets,
-  GREATEST(COALESCE(v.realized_weekly, 0) - COALESCE(dr.v_dev_req_semana, 0), 0) AS realized_weekly,
+  COALESCE(v.realized_weekly, 0) AS realized_weekly,
   COALESCE(v.weekly_closed_budgets, 0) AS weekly_closed_budgets
 FROM ADM.funcionarios f
 INNER JOIN metas_v_cte mm ON mm.seller_id = f.funcionario_id
 LEFT JOIN vendas_v_final v ON v.seller_id = f.funcionario_id
 LEFT JOIN carteira_v_cte cw ON cw.seller_id = f.funcionario_id
 LEFT JOIN positivacao_v_cte pv ON pv.seller_id = f.funcionario_id
-LEFT JOIN dev_req_v dr ON dr.seller_id = f.funcionario_id
 WHERE f.funcionario_id IN (244, 12, 17, 67, 200, 110, 193, 114, 215, 108, 163, 46)
 ORDER BY net_sales DESC
 `;
@@ -240,41 +205,42 @@ const SQL_DIAS = `SELECT COUNT(*) AS uteis_mes, COUNT(CASE WHEN T.D <= TRUNC(SYS
 
 const SQL_HISTORY = `
 WITH
-  meses_agrupados AS (
+  vendas_historico AS (
     SELECT
       TRUNC(o.data_recebimento, 'MM') AS mes,
-      SUM(o.valor_produtos - o.valor_desconto) AS v_prod,
+      SUM(o.valor_produtos - o.valor_desconto - COALESCE(o.valor_frete_cif_embutido, 0)) AS v_prod,
       SUM(COALESCE(o.valor_outras_despesas, 0)) AS v_outros,
-      SUM(o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id)) AS base_l,
-      SUM((o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id)) * (COALESCE(o.perc_lucro_fechamento, 0) / 100.0)) AS luc_abs
+      SUM(o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id) - COALESCE(o.valor_frete_cif_embutido, 0)) AS bs,
+      SUM((o.valor_produtos - o.valor_desconto - COALESCE(o.valor_total_retencao_fin, 0) - (SELECT SUM(COALESCE(io.valor_juros_embutidos, 0)) FROM ADM.itens_orcamentos io WHERE io.orcamento_id = o.orcamento_id) - COALESCE(o.valor_frete_cif_embutido, 0)) * (COALESCE(o.perc_lucro_fechamento, 0) / 100.0)) AS luc
     FROM ADM.orcamentos o
     WHERE o.data_recebimento >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -16)
-      AND o.data_recebimento IS NOT NULL
       AND o.empresa_id IN (1, 2, 3, 5, 6)
       AND (o.pedido_fechado = 'S' OR o.recebido = 'S')
       AND COALESCE(o.cancelado, 'N') = 'N'
     GROUP BY TRUNC(o.data_recebimento, 'MM')
   ),
-  devolucoes_historico AS (
+  dev_historico AS (
     SELECT
-      TRUNC(n.data_emissao, 'MM') AS mes,
-      SUM(n.valor_produtos) AS v_dev,
-      SUM(n.valor_produtos * 0.09) AS luc_d -- Estimativa de 9% de lucro perdido na devolução
-    FROM ADM.notas_fiscais n
-    WHERE n.data_emissao >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -16)
-      AND n.empresa_id IN (1, 2, 3, 5, 6)
-      AND (n.devolucao_id IS NOT NULL OR n.cfop_id IN ('1.201', '1.202', '1.410', '1.411', '2.201', '2.202', '2.410', '2.411'))
-    GROUP BY TRUNC(n.data_emissao, 'MM')
+      TRUNC(d.data_devolucao, 'MM') AS mes,
+      SUM(d.valor_produtos - d.valor_desconto) AS v_dev,
+      SUM(d.valor_produtos - d.valor_desconto - COALESCE(d.valor_total_retencao_fin, 0) - COALESCE(d.valor_juros_embutidos, 0)) AS bs_dev,
+      SUM((d.valor_produtos - d.valor_desconto - COALESCE(d.valor_total_retencao_fin, 0) - COALESCE(d.valor_juros_embutidos, 0)) * 0.09) AS luc_dev
+    FROM ADM.requisicoes_devolucoes d
+    WHERE d.data_devolucao >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -16)
+      AND d.empresa_id IN (1, 2, 3, 5, 6)
+      AND d.status = 'B'
+    GROUP BY TRUNC(d.data_devolucao, 'MM')
   )
 SELECT
-  TO_CHAR(m.mes, 'YYYY-MM') AS month_label,
-  (m.v_prod - COALESCE(d.v_dev, 0) + m.v_outros) AS realized,
-  (m.luc_abs - COALESCE(d.luc_d, 0)) AS profit_abs,
-  CASE WHEN (m.base_l - COALESCE(d.v_dev, 0)) > 0 
-       THEN ((m.luc_abs - COALESCE(d.luc_d, 0)) / (m.base_l - COALESCE(d.v_dev, 0)) * 100.0) 
-       ELSE 0 END AS profit_pct
-FROM meses_agrupados m
-LEFT JOIN devolucoes_historico d ON d.mes = m.mes
+  TO_CHAR(v.mes, 'YYYY-MM') AS month_label,
+  (v.v_prod - COALESCE(d.v_dev, 0) + v.v_outros) AS realized,
+  (v.luc - COALESCE(d.luc_dev, 0)) AS profit_abs,
+  CASE WHEN (v.bs - COALESCE(d.bs_dev, 0)) > 0 
+       THEN ((v.luc - COALESCE(d.luc_dev, 0)) / (v.bs - COALESCE(d.bs_dev, 0)) * 100.0) 
+       ELSE 0 
+  END AS profit_pct
+FROM vendas_historico v
+LEFT JOIN dev_historico d ON d.mes = v.mes
 ORDER BY month_label ASC
 `;
 
